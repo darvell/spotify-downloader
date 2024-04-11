@@ -10,6 +10,7 @@ import subprocess
 import argparse
 from utils.token import AccessToken
 from librespot.metadata import TrackId
+import browsercookie
 
 parser = argparse.ArgumentParser(
                     prog='Spotify Downloader',
@@ -27,21 +28,38 @@ parser.add_argument('--quality', type=str,
                         'MP4_128', 'MP4_128_DUAL', 'MP4_256', 'MP4_256_DUAL',
                         'AAC_24'
                     ])
+parser.add_argument('--episode', type=bool, help='Is the track an episode? Defaults to false. Not required if you are using a URL.', default=False, required=False)
+parser.add_argument('--cdm-api', type=str, help='The URL to a 3rd party CDM API.', default='', required=False)
 args = parser.parse_args()
 
 if __name__ == '__main__':
-    if not isfile('device.wvd'):
-        print('You need to have a device.wvd file in the same directory as this script')
-        exit(1)
+
+    # Check if SPOTIFY_CDM_API is set.
+    if len(args.cdm_api) == 0:
+        if environ.get('SPOTIFY_CDM_API', None):
+            args.cdm_api = environ['SPOTIFY_CDM_API']
 
     if isinstance(args.ffmpeg_path, str) and not isfile(args.ffmpeg_path):
+        # Double check if the user has ffmpeg in their PATH.
+        if not 'ffmpeg' in environ['PATH']:
+            print('Error: FFmpeg was not found in your path!')
+            exit(1)
+
         print('Error: FFmpeg was not found in the specified path!')
         exit(1)
-    elif not 'ffmpeg' in environ['PATH']:
-        print('Error: FFmpeg was not found in your path!')
-        exit(1)
+    
     
     if not isfile('spotify_dc.txt'):
+        # Try using the user's cookie from their browser.
+        try:
+            cookies = browsercookie.load()
+            for cookie in cookies:
+                if cookie.domain == '.spotify.com' and cookie.name == 'sp_dc':
+                    with open('spotify_dc.txt', 'w') as file:
+                        file.write(cookie.value)
+                    break
+        except Exception:
+            pass
         user_token = input('Enter your Spotify "sp_dc" cookie: ')
         with open('spotify_dc.txt', 'w') as file:
             file.write(user_token.replace('Bearer ', ''))
@@ -49,6 +67,22 @@ if __name__ == '__main__':
         user_token = open('spotify_dc.txt', 'r').read()
 
     track_id = args.track_id
+    track_is_episode = args.episode
+
+    # Check if it starts with https://open.spotify.com/
+    if 'https://open.spotify.com/' in track_id:
+        track_id = track_id.replace('https://open.spotify.com/', '')
+        if 'track/' in track_id:
+            track_id = track_id.replace('track/', '')
+        if 'episode/' in track_id:
+            track_id = track_id.replace('episode/', '')
+            episode = True
+        track_id = track_id.split('?')[0]
+
+
+    if 'spotify:episode:' in track_id:
+        track_id = track_id.replace('spotify:episode:', '')
+        track_is_episode = True
 
     if len(track_id) == 22:
         track_id = TrackId.from_base62(track_id).get_gid().hex()
@@ -59,11 +93,11 @@ if __name__ == '__main__':
     audio = Audio()
     metadata = Metadata()
     try:
-        track = audio.get_track(track_id)
+        track = audio.get_track(track_id, track_is_episode)
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 401:
             token.refresh()
-            track = audio.get_track(track_id)
+            track = audio.get_track(track_id, track_is_episode)
         else:
             print('Error:', e)
             exit(1)
@@ -72,32 +106,22 @@ if __name__ == '__main__':
         for file in track['file']:
             if file['format'] == quality:
                 return file
+            
         return None
 
-    pssh = PSSH(requests.get(f"https://seektables.scdn.co/seektable/{track['file'][4]['file_id']}.json").json()['pssh'])
-    device = Device.load('device.wvd')
-    cdm = Cdm.from_device(device)
-    session_id = cdm.open()
-
-    challenge = cdm.get_license_challenge(session_id, pssh)
-    license = requests.post(audio.license_url, headers={
-        'Accept': '*/*',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Accept-Language': 'en',
-        'authorization': f'Bearer {AccessToken().access_token()}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-    }, data=challenge)
-    license.raise_for_status()
-
-    cdm.parse_license(session_id, license.content)
-
+    use_cdm_api = not isfile('device.wvd') or len(args.cdm_api) > 0
+    license_url = audio.license_url
     cdn_file = find_quality(track, args.quality)
+    if cdn_file is None:
+        # Grab the first. Sorry, IDC.
+        cdn_file = track['file'][0]
     url = audio.get_audio_urls(cdn_file['file_id'])[0]
     audio = requests.get(url)
     audio.raise_for_status()
     audio_type = cdn_file['format'].split('_')[0].lower().replace('mp4', 'm4a')
+    # artist_names = ' & '.join([artist['name'] for artist in track['artist']])
     audio_file = abspath(f"./{track['name']}-encrypted.{audio_type}")
-    audio_file_decrypted = abspath(f"./{track['name']}.{audio_type}")
+    audio_file_decrypted = abspath(f"./{track['artist'][0]['name']} - {track['name']}.{audio_type}")
 
     if isfile(audio_file):
         remove(audio_file)
@@ -107,18 +131,48 @@ if __name__ == '__main__':
     with open(audio_file, 'wb') as file:
         file.write(audio.content)
         file.close()
+    
+    decryption_keys = []
 
-    for key in cdm.get_keys(session_id):
+    if use_cdm_api:
+        pssh = requests.get(f"https://seektables.scdn.co/seektable/{track['file'][4]['file_id']}.json").json()['pssh']
+        result = requests.post(args.cdm_api, json={"pssh": pssh, "license": license_url, "headers": f"Authorization: Bearer {AccessToken().access_token()}"}).json()
+        for key in result['keys']:
+            decryption_keys.append(key["key"].split(":")[1])
+    else:
+        pssh = PSSH(requests.get(f"https://seektables.scdn.co/seektable/{track['file'][4]['file_id']}.json").json()['pssh'])
+
+        device = Device.load('device.wvd')
+        cdm = Cdm.from_device(device)
+        session_id = cdm.open()
+
+        challenge = cdm.get_license_challenge(session_id, pssh)
+        license = requests.post(audio.license_url, headers={
+            'Accept': '*/*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'en',
+            'authorization': f'Bearer {AccessToken().access_token()}',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+        }, data=challenge)
+        license.raise_for_status()
+
+        cdm.parse_license(session_id, license.content)
+        for key in cdm.get_keys(session_id):
+            decryption_keys.append(key.key.hex())
+
+    for key in decryption_keys:
         try:
             path = args.ffmpeg_path if isinstance(args.ffmpeg_path, str) else 'ffmpeg'
             cmd = [
-                path, '-decryption_key', key.key.hex(), '-i', audio_file, audio_file_decrypted
+                path, '-decryption_key', key, '-i', audio_file, audio_file_decrypted
             ]
             subprocess.run(cmd, stdout=None, stderr=None, stdin=None, shell=False, check=True)
         except Exception as e:
             print('Error:', e)
             exit(1)
-    cdm.close(session_id)
+    
+    if not use_cdm_api:
+        cdm.close(session_id)
 
     remove(audio_file)
 

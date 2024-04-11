@@ -12,9 +12,12 @@ class Audio:
 
     def get_track_url(self, track_id):
         return f'https://spclient.wg.spotify.com/metadata/4/track/{track_id}?market=from_token'
-
-    def get_track(self, track_id):
-        url = self.get_track_url(track_id)
+    
+    def get_episode_url(self, episode_id):
+        return f'https://spclient.wg.spotify.com/metadata/4/episode/{episode_id}?market=from_token'
+    
+    def get_track(self, track_id, is_episode=False):
+        url = self.get_episode_url(track_id) if is_episode else self.get_track_url(track_id)
         headers = {
             'Accept': 'application/json',
             'Accept-Encoding': 'gzip, deflate, br',
